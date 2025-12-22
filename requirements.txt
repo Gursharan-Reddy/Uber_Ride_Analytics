@@ -1,0 +1,10 @@
+pandas
+pyarrow
+fastparquet
+matplotlib
+seaborn
+scikit-learn
+streamlit
+pydeck
+geopandas
+joblib

@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+
+# Data and Models (Large files)
+data/raw/
+data/processed/
+outputs/*.pkl
+outputs/figures/
+
+# OS files
+.DS_Store
+Thumbs.db
