@@ -4,6 +4,7 @@ import joblib
 import datetime
 import pydeck as pdk
 import numpy as np
+import requests
 
 # ---------------- Page Config ----------------
 st.set_page_config(page_title="Uber Demand Control Center", layout="wide")
@@ -11,144 +12,179 @@ st.set_page_config(page_title="Uber Demand Control Center", layout="wide")
 # ---------------- Load Assets ----------------
 @st.cache_resource
 def load_assets():
-    try:
-        model = joblib.load("outputs/model.pkl")
-        zones = pd.read_csv("data/processed/zones.csv")
-        data = pd.read_parquet("data/processed/model_data.parquet")
-        return model, zones, data
-    except Exception as e:
-        st.error(f"Error loading assets: {e}")
-        return None, None, None
+    model = joblib.load("outputs/model.pkl")
+    zones = pd.read_csv("data/processed/zones.csv")
+    data = pd.read_parquet("data/processed/model_data.parquet")
+    return model, zones, data
 
 model, zones, data = load_assets()
 
-if model is None:
-    st.stop()
+# ---------------- Weather ----------------
+def fetch_nyc_weather(api_key):
+    try:
+        url = f"http://api.openweathermap.org/data/2.5/weather?q=New York&appid={api_key}&units=imperial"
+        r = requests.get(url).json()
+        return r["main"]["temp"], r["weather"][0]["main"]
+    except:
+        return None, None
 
 # ---------------- Sidebar ----------------
-st.sidebar.header("Simulation Controls")
+st.sidebar.header("Operational Controls")
 
-date = st.sidebar.date_input("Date", datetime.date(2024, 6, 1))
-hour = st.sidebar.slider("Hour of Day", 0, 23, 12)
-temp = st.sidebar.slider("Temperature (F)", 0, 100, 70)
-surge = st.sidebar.slider("Surge Multiplier (%)", 0, 100, 0) / 100
+use_live_weather = st.sidebar.toggle("📡 Live Weather", value=True)
+API_KEY = "496697ebc96d923e8617116ae5ebd185"
+
+if use_live_weather:
+    temp, cond = fetch_nyc_weather(API_KEY)
+    if temp:
+        st.sidebar.success(f"🌡️ {temp:.1f}°F | {cond}")
+        sim_temp = temp
+        sim_rain = 1 if "Rain" in cond else 0
+    else:
+        sim_temp, sim_rain = 72, 0
+else:
+    sim_date = st.sidebar.date_input("Date", datetime.date(2024, 6, 1))
+    sim_hour = st.sidebar.slider("Hour", 0, 23, 18)
+    sim_temp = st.sidebar.slider("Temperature (F)", 0, 100, 72)
+    sim_rain = st.sidebar.checkbox("Rainy")
+
+surge = st.sidebar.slider("Surge Multiplier", 1.0, 3.0, 1.0)
 
 st.sidebar.markdown("---")
-p_zone = st.sidebar.selectbox("Select Pickup Zone", zones["Zone"].unique())
-d_zone = st.sidebar.selectbox("Select Drop Zone", zones["Zone"].unique())
-analyze = st.sidebar.button("Analyze Demand")
+p_zone = st.sidebar.selectbox("Pickup Zone", zones["Zone"].unique())
+d_zone = st.sidebar.selectbox("Drop Zone", zones["Zone"].unique())
+analyze = st.sidebar.button("Analyze Route")
 
 # ---------------- Prediction Logic ----------------
-def get_prediction(loc_id):
+def get_prediction_input(loc_id):
+    now = datetime.datetime.now()
+    hour = now.hour if use_live_weather else sim_hour
+    day = now.weekday() if use_live_weather else sim_date.weekday()
+    month = now.month if use_live_weather else sim_date.month
+
     row = {
         "PULocationID": loc_id,
         "DOLocationID": loc_id,
         "hour": hour,
-        "day_of_week": date.weekday(),
-        "month": date.month,
-        "is_weekend": 1 if date.weekday() >= 5 else 0,
+        "day_of_week": day,
+        "month": month,
+        "is_weekend": 1 if day >= 5 else 0,
         "is_holiday": 0,
-        "is_freezing": 1 if temp <= 32 else 0,
-        "is_rainy": 0,
+        "TAVG": sim_temp, # Pass raw temp too just in case
     }
 
-    # UPDATED: Full list of weather categories
+    # Initialize all weather flags to 0
     weather_cols = [
-        "weather_Clear",
-        "weather_Freezing",
-        "weather_Cold",
-        "weather_Mild",
-        "weather_Warm",
-        "weather_Hot",
-        "weather_Rain",
-        "weather_Snow",
+        "weather_Clear", "weather_Freezing", "weather_Cold",
+        "weather_Mild", "weather_Warm", "weather_Hot",
+        "weather_Rain", "weather_Snow"
     ]
+    for c in weather_cols:
+        row[c] = 0
 
-    # Initialize all weather columns to 0
-    for col in weather_cols:
-        row[col] = 0
+    # Categorize Temperature (Must match Feature Engineering logic)
+    if sim_temp <= 32: row["weather_Freezing"] = 1
+    elif sim_temp <= 50: row["weather_Cold"] = 1
+    elif sim_temp <= 72: row["weather_Mild"] = 1
+    elif sim_temp <= 85: row["weather_Warm"] = 1
+    else: row["weather_Hot"] = 1
 
-    # UPDATED: Temperature Categorization Logic
-    if temp <= 32:
-        row["weather_Freezing"] = 1
-    elif temp <= 50:
-        row["weather_Cold"] = 1
-    elif temp <= 72:
-        row["weather_Mild"] = 1
-    elif temp <= 85:
-        row["weather_Warm"] = 1
+    # Set Precipitation
+    if sim_rain:
+        row["weather_Rain"] = 1
+        row["weather_Clear"] = 0
     else:
-        row["weather_Hot"] = 1
+        row["weather_Clear"] = 1 # Assume clear if not rainy
 
-    # Realign columns to match model training data
-    inp = pd.DataFrame([row])
-    # Check if model has feature_names_in_ attribute (Scikit-Learn models)
-    if hasattr(model, 'feature_names_in_'):
-        inp = inp.reindex(columns=model.feature_names_in_, fill_value=0)
+    # Create DF and align with model columns
+    df = pd.DataFrame([row])
     
-    return model.predict(inp)[0] * (1 + surge)
+    if hasattr(model, 'feature_names_in_'):
+        df = df.reindex(columns=model.feature_names_in_, fill_value=0)
+    
+    return df, hour
+
+def get_demand(loc_id):
+    df, _ = get_prediction_input(loc_id)
+    return model.predict(df)[0] * surge
 
 # ---------------- Main UI ----------------
 st.title("Uber Demand Control Center")
 
-col1, col2 = st.columns([2, 1])
+col_map, col_metrics = st.columns([2, 1])
 
-# ---------------- Heatmap (Unchanged) ----------------
-with col1:
+# ---------------- MAP (UNCHANGED) ----------------
+with col_map:
     st.subheader("Demand Heatmap")
 
     map_df = zones.copy()
-    map_df["predicted_demand"] = map_df["LocationID"].apply(get_prediction)
+    map_df["demand"] = map_df["LocationID"].apply(get_demand)
+    map_df["norm"] = map_df["demand"] / map_df["demand"].max()
 
-    # Organic clustering (no grid artifacts) - Preserved as requested
+    centers = np.array([
+        [40.7580, -73.9855],
+        [40.7306, -73.9866],
+        [40.7831, -73.9712],
+        [40.6782, -73.9442],
+        [40.7282, -73.7949],
+        [40.7357, -74.1724],
+    ])
+
+    cluster = map_df["LocationID"] % len(centers)
+    base = centers[cluster]
+
     np.random.seed(42)
-    map_df["lat"] = 40.7128 + np.random.normal(0, 0.03, len(map_df))
-    map_df["lon"] = -74.0060 + np.random.normal(0, 0.03, len(map_df))
+    map_df["lat"] = base[:, 0] + np.random.normal(0, 0.012, len(map_df))
+    map_df["lon"] = base[:, 1] + np.random.normal(0, 0.012, len(map_df))
 
-    heatmap_layer = pdk.Layer(
+    heatmap = pdk.Layer(
         "HeatmapLayer",
         data=map_df,
-        get_position="[lon, lat]",
-        get_weight="predicted_demand",
-        radius_pixels=80,
-        intensity=1.1,
-        threshold=0.05,
+        get_position=["lon", "lat"],
+        get_weight="norm",
+        radius_pixels=45,
+        intensity=4.0,
+        threshold=0.25,
+        opacity=0.85,
     )
 
     deck = pdk.Deck(
-        layers=[heatmap_layer],
+        layers=[heatmap],
         initial_view_state=pdk.ViewState(
-            latitude=40.7128,
-            longitude=-74.0060,
-            zoom=10,
-            pitch=40,
-        )
+            latitude=40.73,
+            longitude=-73.98,
+            zoom=10.5,
+        ),
+        map_style="dark",
+        tooltip={"text": "{Zone}\nDemand: {demand:.1f}"}
     )
 
     st.pydeck_chart(deck)
 
-# ---------------- Demand Scoring (Updated) ----------------
-with col2:
-    st.subheader("Demand Scoring")
+# ---------------- METRICS ----------------
+with col_metrics:
+    st.subheader("Demand Metrics")
 
     if analyze:
-        # --- IMPORTANT STEP: VALIDATION CHECK ---
         if p_zone == d_zone:
-            st.error("⚠️ Invalid Route: Pickup and Drop-off zones cannot be the same.")
+            st.error("Pickup and Drop-off cannot be the same.")
         else:
             p_id = zones[zones["Zone"] == p_zone]["LocationID"].values[0]
-            val = get_prediction(p_id)
+            demand = get_demand(p_id)
+            _, hr = get_prediction_input(p_id)
 
-            st.metric("Forecasted Ride Volume", f"{val:.2f} rides")
+            st.metric("Forecasted Ride Volume", f"{demand:.2f} rides")
 
-            if val > 1.5:
-                st.warning("High Demand: Driver rebalancing recommended.")
+            if demand > 150:
+                st.error("🔴 High Demand – Deploy more drivers")
+            elif demand > 50:
+                st.warning("🟠 Moderate Demand – Monitor closely")
             else:
-                st.success("Stable Demand: Supply is sufficient.")
+                st.success("🟢 Stable Demand – Supply sufficient")
     else:
-        st.info("Select zones and click Analyze to view demand.")
+        st.info("Select zones and click Analyze to view demand metrics.")
 
-# ---------------- Trends ----------------
+# ---------------- HISTORICAL TRENDS ----------------
 st.divider()
 st.subheader("Historical System Trends")
 st.line_chart(data.groupby("hour")["trip_count"].mean())

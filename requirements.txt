@@ -8,3 +8,5 @@ streamlit
 pydeck
 geopandas
 joblib
+shap
+matplotlib
