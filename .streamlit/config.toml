@@ -1,0 +1,6 @@
+[theme]
+primaryColor = "#29B5E8"    # "Electric Blue" for primary actions
+backgroundColor = "#0E1117" # Deep charcoal background (reduces eye strain)
+secondaryBackgroundColor = "#262730" # Slightly lighter for sidebars/cards
+textColor = "#FAFAFA"       # High contrast white text
+font = "sans serif"         # Clean, modern typography

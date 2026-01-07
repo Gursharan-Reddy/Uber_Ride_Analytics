@@ -6,9 +6,6 @@ import numpy as np
 import joblib
 import os
 import warnings
-
-# --- FIX: SUPPRESS NOISY WARNINGS ---
-# This ignores the "sklearn.utils.parallel.delayed" warnings from flooding the console
 warnings.filterwarnings("ignore", category=UserWarning, module="sklearn.utils.parallel")
 
 def train_demand_model(data_path='data/processed/model_data.parquet'):
