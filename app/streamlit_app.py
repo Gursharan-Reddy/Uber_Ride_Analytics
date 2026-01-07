@@ -1,280 +1,328 @@
+import warnings
+import os
+import sys
+
+# -----------------------------------------------------------------------------
+# 1. WARNING SUPPRESSION
+# -----------------------------------------------------------------------------
+warnings.filterwarnings("ignore", message=".*sklearn.utils.parallel.delayed.*")
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn.utils.parallel")
+
 import streamlit as st
 import pandas as pd
 import joblib
 import datetime
 import pydeck as pdk
 import numpy as np
-import requests
-import matplotlib.pyplot as plt
+import sqlite3
 
-# ---------------- 1. PAGE CONFIGURATION ----------------
+# -----------------------------------------------------------------------------
+# 2. PATH CONFIGURATION
+# -----------------------------------------------------------------------------
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.append(BASE_DIR)
+
+from src.external_apis import fetch_nyc_weather, get_traffic_congestion, get_nyc_events
+
+# -----------------------------------------------------------------------------
+# 3. PAGE CONFIGURATION
+# -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Uber Operations Dashboard",
+    page_title="Uber Operations Command",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
+    page_icon="Taxi"
 )
 
-# ---------------- 2. CUSTOM CSS STYLING ----------------
-def load_custom_css():
+# -----------------------------------------------------------------------------
+# 4. PROFESSIONAL UI STYLING
+# -----------------------------------------------------------------------------
+def render_professional_ui():
     st.markdown("""
         <style>
-        /* Card Styling for Metrics */
-        div[data-testid="stMetric"] {
+        .stApp { background-color: #0E1117; }
+        .css-card {
             background-color: #262730;
+            border: 1px solid #363B47;
+            border-radius: 10px;
+            padding: 20px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+            margin-bottom: 20px;
+            height: 100%;          
+            min-height: 240px;     
+            display: flex;         
+            flex-direction: column;
+            justify-content: space-between; 
+        }
+        div[data-testid="stMetric"] {
+            background-color: #1F2229;
             padding: 15px;
             border-radius: 8px;
-            border-left: 5px solid #29B5E8;
-            box-shadow: 2px 2px 5px rgba(0,0,0,0.3);
-            /* Force equal height for all metrics */
-            min-height: 130px; 
-            display: flex;
-            flex-direction: column;
-            justify-content: center;
+            border-left: 4px solid #29B5E8;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+            transition: transform 0.2s;
         }
-        /* Tab Styling */
-        button[data-baseweb="tab"] {
-            font-size: 16px;
+        div[data-testid="stMetric"]:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 8px rgba(41, 181, 232, 0.2);
+        }
+        div.stButton > button {
+            background-color: #29B5E8;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            padding: 10px 24px;
             font-weight: 600;
+            transition: all 0.3s ease;
         }
-        /* Alert/Status Box Styling */
-        div[data-testid="stMarkdownContainer"] p {
-            font-size: 1.05rem;
+        div.stButton > button:hover {
+            background-color: #1C9AD6;
+            box-shadow: 0 4px 12px rgba(41, 181, 232, 0.3);
         }
-        /* Sidebar Header Styling */
-        .sidebar-header {
-            font-size: 1.2rem;
-            font-weight: bold;
-            margin-top: 20px;
-            margin-bottom: 10px;
-            color: #29B5E8;
+        section[data-testid="stSidebar"] {
+            background-color: #161920;
+            border-right: 1px solid #363B47;
         }
+        h1, h2, h3 { color: #FFFFFF; font-family: 'Inter', sans-serif; }
         </style>
     """, unsafe_allow_html=True)
 
-load_custom_css()
+render_professional_ui()
 
-# ---------------- 3. ASSET LOADING ----------------
+# -----------------------------------------------------------------------------
+# 5. STATE INITIALIZATION
+# -----------------------------------------------------------------------------
+if 'live_stats' not in st.session_state:
+    st.session_state['live_stats'] = {"traffic": 0.0, "event": "No Data", "event_count": 0}
+if 'calculation_done' not in st.session_state:
+    st.session_state['calculation_done'] = False
+if 'route_inputs' not in st.session_state:
+    st.session_state['route_inputs'] = {}
+
+# -----------------------------------------------------------------------------
+# 6. ASSET LOADING
+# -----------------------------------------------------------------------------
 @st.cache_resource
 def load_assets():
     try:
-        model = joblib.load("outputs/model.pkl")
-        zones = pd.read_csv("data/processed/zones.csv")
-        data = pd.read_parquet("data/processed/model_data.parquet")
-        return model, zones, data
-    except Exception as e:
-        st.error(f"System Error: {e}")
+        model_path = os.path.join(BASE_DIR, "outputs", "model.pkl")
+        db_path = os.path.join(BASE_DIR, "data", "taxi_system.db")
+        
+        if not os.path.exists(model_path):
+            return None, None, None
+            
+        model = joblib.load(model_path)
+        conn = sqlite3.connect(db_path, check_same_thread=False)
+        zones = pd.read_sql("SELECT * FROM zones", conn)
+        return model, zones, conn
+    except:
         return None, None, None
 
-model, zones, data = load_assets()
+model, zones, db_conn = load_assets()
 
 if model is None:
+    st.error("System Offline: Model or Database missing. Please run init_db.py first.")
     st.stop()
 
-# ---------------- 4. LIVE WEATHER INTEGRATION ----------------
-def fetch_nyc_weather():
-    # API Key is used internally but not displayed in the UI
-    API_KEY = "496697ebc96d923e8617116ae5ebd185"
-    try:
-        url = f"http://api.openweathermap.org/data/2.5/weather?q=New York&appid={API_KEY}&units=imperial"
-        r = requests.get(url, timeout=3).json()
-        if r.get("cod") != 200: return None, None
-        return r["main"]["temp"], r["weather"][0]["main"]
-    except:
-        return None, None
-
-# ---------------- 5. SIDEBAR CONTROLS ----------------
+# -----------------------------------------------------------------------------
+# 7. SIDEBAR CONTROLS
+# -----------------------------------------------------------------------------
 with st.sidebar:
-    st.title("Control Panel")
+    st.markdown("## Control Panel")
     
-    # --- Data Settings Section ---
-    st.markdown('<p class="sidebar-header">Data Settings</p>', unsafe_allow_html=True)
-    use_live_weather = st.toggle("Live Weather Mode", value=True)
-
-    # Global Simulation Variables
-    if use_live_weather:
+    st.markdown("### Live Feeds")
+    use_live = st.toggle("Live Weather Sync", value=True)
+    
+    if use_live:
         temp, cond = fetch_nyc_weather()
         if temp:
-            st.info(f"NYC Live Conditions: {temp:.0f} F | {cond}")
-            sim_temp = temp
-            sim_rain = 1 if "Rain" in cond or "Drizzle" in cond else 0
+            st.info(f"NYC: {temp:.0f}F | {cond}")
+            sim_temp, sim_rain = temp, (1 if "Rain" in cond else 0)
         else:
-            st.warning("Weather API Unavailable. Switching to defaults.")
+            st.warning("Weather API Unreachable")
             sim_temp, sim_rain = 72, 0
+        sim_hour = datetime.datetime.now().hour
+        sim_date = datetime.datetime.now().date()
     else:
-        st.subheader("Manual Simulation")
-        sim_date = st.date_input("Date", datetime.date(2024, 6, 1))
-        sim_hour = st.slider("Hour (0-23)", 0, 23, 18)
+        sim_date = st.date_input("Simulation Date", datetime.date.today())
+        sim_hour = st.slider("Simulation Hour", 0, 23, 12)
         sim_temp = st.slider("Temperature (F)", 0, 100, 72)
-        sim_rain = st.checkbox("Rain Precipitation")
+        sim_rain = st.checkbox("Rain Conditions")
 
     st.markdown("---")
     
-    # --- Market Controls Section ---
-    st.markdown('<p class="sidebar-header">Market Controls</p>', unsafe_allow_html=True)
-    surge = st.slider("Surge Multiplier", 1.0, 3.0, 1.0, step=0.1, help="Adjust price multiplier to simulate high demand.")
+    tomtom_key = st.secrets["api_keys"]["tomtom"]
+    tm_key = st.secrets["api_keys"]["ticketmaster"]
     
-    st.markdown("### Route Selection")
-    p_zone = st.selectbox("Pickup Location", zones["Zone"].unique(), index=0)
-    d_zone = st.selectbox("Dropoff Location", zones["Zone"].unique(), index=1)
+    if st.button("Scan Traffic and Events", use_container_width=True):
+        with st.spinner("Scanning real-time sources..."):
+            event_name, event_count = get_nyc_events(tm_key)
+            congestion = get_traffic_congestion(40.7128, -74.0060, tomtom_key)
+            st.session_state['live_stats'] = {
+                "traffic": congestion, 
+                "event": event_name, 
+                "event_count": event_count
+            }
+            st.success("Data Updated!")
+
+    st.markdown("---")
     
-    analyze = st.button("Calculate Demand", type="primary", use_container_width=True)
+    st.markdown("### Route Logistics")
+    
+    # --- UPDATE 1: SURGE SLIDER MODIFIED (0-100%) ---
+    surge_pct = st.slider("Surge Percentage (%)", 0, 100, 0, step=5)
+    
+    # --- UPDATE 2: NORMALIZE TO MULTIPLIER ---
+    # Convert 0-100% to a 1.0x-2.0x multiplier
+    surge_multiplier = 1 + (surge_pct / 100.0)
+    
+    p_zone = st.selectbox("Pickup Point", zones["Zone"].unique(), index=0)
+    d_zone = st.selectbox("Dropoff Point", zones["Zone"].unique(), index=1)
+    
+    if st.button("Calculate Demand", type="primary", use_container_width=True):
+        st.session_state['calculation_done'] = True
+        st.session_state['route_inputs'] = {
+            "p_zone": p_zone,
+            "d_zone": d_zone,
+            "surge_pct": surge_pct,          # Store raw % for display
+            "surge_mult": surge_multiplier   # Store multiplier for math
+        }
 
-# ---------------- 6. PREDICTION ENGINE ----------------
-def get_prediction_input(loc_id):
-    now = datetime.datetime.now()
-    # Determine Time Basis
-    if use_live_weather:
-        hour, day, month = now.hour, now.weekday(), now.month
-    else:
-        hour = sim_hour
-        day, month = sim_date.weekday(), sim_date.month
-
-    # Feature Construction
+# -----------------------------------------------------------------------------
+# 8. PREDICTION ENGINE (Using Calculated Multiplier)
+# -----------------------------------------------------------------------------
+def predict_rides(loc_id, hour_val=None, active_surge_mult=None):
+    if hour_val is None: 
+        hour_val = sim_hour
+    
+    # Use the passed multiplier, or fall back to the global sidebar one
+    if active_surge_mult is None:
+        active_surge_mult = surge_multiplier
+        
+    day = sim_date.weekday()
     row = {
-        "PULocationID": loc_id, "DOLocationID": loc_id,
-        "hour": hour, "day_of_week": day, "month": month,
-        "is_weekend": 1 if day >= 5 else 0, "is_holiday": 0,
-        "TAVG": sim_temp 
+        "PULocationID": loc_id, "hour": hour_val, "day_of_week": day, 
+        "month": sim_date.month, "is_weekend": 1 if day >= 5 else 0, "TAVG": sim_temp,
+        "weather_Rain": 1 if sim_rain else 0, "weather_Clear": 0 if sim_rain else 1
     }
-
-    # Weather Categorization
-    weather_flags = ["weather_Clear", "weather_Freezing", "weather_Cold", 
-                     "weather_Mild", "weather_Warm", "weather_Hot", 
-                     "weather_Rain", "weather_Snow"]
-    for c in weather_flags: row[c] = 0
-
-    # Temperature Binning
-    if sim_temp <= 32: row["weather_Freezing"] = 1
-    elif sim_temp <= 50: row["weather_Cold"] = 1
-    elif sim_temp <= 72: row["weather_Mild"] = 1
-    elif sim_temp <= 85: row["weather_Warm"] = 1
-    else: row["weather_Hot"] = 1
-
-    # Rain Logic
-    if sim_rain:
-        row["weather_Rain"] = 1
-    else:
-        row["weather_Clear"] = 1
-
-    # DataFrame creation aligned with model features
     df = pd.DataFrame([row])
     if hasattr(model, 'feature_names_in_'):
         df = df.reindex(columns=model.feature_names_in_, fill_value=0)
     
-    return df, hour
+    # --- UPDATE 3: USE MULTIPLIER IN PREDICTION ---
+    return model.predict(df)[0] * active_surge_mult
 
-def get_demand(loc_id):
-    df, _ = get_prediction_input(loc_id)
-    return model.predict(df)[0] * surge
-
-# ---------------- 7. MAIN DASHBOARD UI ----------------
-
-# A. Header
+# -----------------------------------------------------------------------------
+# 9. MAIN DASHBOARD UI
+# -----------------------------------------------------------------------------
 st.title("Uber Operations Command Center")
-st.markdown("Real-time supply chain monitoring and predictive analytics.")
+st.markdown("Real-time predictive analytics and supply chain optimization.")
 
-# B. Heads-Up Display (KPI Ribbon)
-avg_demand = data[data['hour'] == 18]['trip_count'].mean() * surge 
-kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-kpi1.metric("System Status", "Normal" if surge < 1.5 else "High Volume", delta="Stable" if surge < 1.5 else "Surge Active")
-kpi2.metric("Active Fleet", "1,240 Units", delta="+12 Online")
-kpi3.metric("Avg Wait Time", "4.2 min", delta_color="inverse", delta="-0.5 min")
-kpi4.metric("Est. Hourly Revenue", f"${(avg_demand * 22.5 * 100):,.0f}", delta=f"Multiplier {surge}x")
+st.markdown("### System Status")
+k1, k2, k3, k4 = st.columns(4)
+
+try:
+    avg_val = pd.read_sql(f"SELECT AVG(trip_count) FROM model_data WHERE hour = {sim_hour}", db_conn).iloc[0,0]
+except:
+    avg_val = 0
+
+stats = st.session_state['live_stats']
+k1.metric("Predicted Ride Vol", f"{avg_val:.1f}", delta="Normal Vol")
+k2.metric("Active Fleet", "1,240", delta="+12 Online")
+k3.metric("Traffic Congestion", f"{stats['traffic']*100:.0f}%", 
+          delta="High" if stats['traffic'] > 0.3 else "Flowing", delta_color="inverse")
+k4.metric("Live Events", f"{stats['event_count']}", delta=stats['event'][:10]+"..." if len(stats['event']) > 10 else stats['event'])
 
 st.markdown("---")
 
-# C. SECTION 1: THE MAP (Centered & Full Width)
-st.subheader("Geospatial Demand Density")
-
-with st.spinner("Updating geospatial data..."):
+st.markdown("### Demand Heatmap")
+with st.container():
     map_df = zones.copy()
-    # Generate predictions
-    map_df["demand"] = map_df["LocationID"].apply(get_demand)
-    map_df["norm"] = map_df["demand"] / map_df["demand"].max()
+    if len(map_df) > 500: map_df = map_df.sample(500)
+    
+    map_df["demand"] = map_df["LocationID"].apply(lambda x: predict_rides(x))
+    map_df["norm"] = map_df["demand"] / (map_df["demand"].max() + 1) 
 
-    # Clustering Logic
-    centers = np.array([
-        [40.7580, -73.9855], [40.7306, -73.9866], [40.7831, -73.9712],
-        [40.6782, -73.9442], [40.7282, -73.7949], [40.7357, -74.1724],
-    ])
+    centers = np.array([[40.75, -73.98], [40.71, -74.00], [40.78, -73.96]])
     cluster = map_df["LocationID"] % len(centers)
     base = centers[cluster]
-    np.random.seed(42)
-    map_df["lat"] = base[:, 0] + np.random.normal(0, 0.012, len(map_df))
-    map_df["lon"] = base[:, 1] + np.random.normal(0, 0.012, len(map_df))
-
-    # PyDeck Layer
-    heatmap = pdk.Layer(
-        "HeatmapLayer",
-        data=map_df,
-        get_position=["lon", "lat"],
-        get_weight="norm",
-        radius_pixels=45,
-        intensity=4.0,
-        threshold=0.25,
-        opacity=0.85,
-    )
+    map_df["lat"] = base[:, 0] + np.random.normal(0, 0.008, len(map_df))
+    map_df["lon"] = base[:, 1] + np.random.normal(0, 0.008, len(map_df))
 
     deck = pdk.Deck(
-        layers=[heatmap],
-        initial_view_state=pdk.ViewState(latitude=40.73, longitude=-73.98, zoom=10.5),
-        map_style="dark",
-        tooltip={"text": "{Zone}\nDemand: {demand:.1f}"}
+        initial_view_state=pdk.ViewState(latitude=40.73, longitude=-73.98, zoom=11, pitch=50),
+        layers=[
+            pdk.Layer("HeatmapLayer", data=map_df, get_position=["lon", "lat"], get_weight="norm", radius_pixels=60, intensity=2, threshold=0.3),
+            pdk.Layer("ScatterplotLayer", data=map_df[map_df['demand'] > 100], get_position=["lon", "lat"], get_radius=100, get_fill_color=[255, 140, 0, 140], pickable=True)
+        ],
+        tooltip={"text": "{Zone}\nPredicted Demand: {demand:.1f}"}
     )
+    st.pydeck_chart(deck, width="stretch")
+
+if st.session_state['calculation_done']:
+    st.markdown("---")
+    st.markdown("### Route Economics Analysis")
     
-    # Map height set to 600px for balance
-    st.pydeck_chart(deck, use_container_width=True, height=600)
-
-# D. SECTION 2: ROUTE ECONOMICS (Below Map, Horizontal Layout)
-st.subheader("Route Economics")
-
-if analyze:
-    if p_zone == d_zone:
-        st.error("Error: Pickup and Dropoff locations cannot be identical.")
+    inputs = st.session_state['route_inputs']
+    
+    if inputs['p_zone'] == inputs['d_zone']:
+        st.error("Pickup and Dropoff locations cannot be the same.")
     else:
-        p_id = zones[zones["Zone"] == p_zone]["LocationID"].values[0]
-        demand_val = get_demand(p_id)
-        _, active_hour = get_prediction_input(p_id)
-
-        # Night Pricing Logic
-        is_night = (active_hour >= 21) or (active_hour < 9)
-        time_mod = 2.0 if is_night else 1.0
-        fare_status = "Night Fare (2x)" if is_night else "Standard Fare"
+        p_row = zones[zones["Zone"] == inputs['p_zone']]
+        d_row = zones[zones["Zone"] == inputs['d_zone']]
         
-        # Revenue Calculation
-        base_fare = 22.50
-        final_fare = base_fare * surge * time_mod
-        est_rev = demand_val * final_fare
-
-        # Display Route Info
-        st.info(f"Route Analysis: **{p_zone}** to **{d_zone}**")
-        
-        # HORIZONTAL METRICS (3 Columns) with ALIGNMENT FIX
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Predicted Rides", f"{demand_val:.1f}", delta="Trips/Hr")
-        c2.metric("Base Fare", f"${final_fare:.2f}", delta=fare_status)
-        # Added dummy delta "Gross Est." to force equal height/alignment with the other two boxes
-        c3.metric("Projected Revenue", f"${est_rev:,.2f}", delta="Gross Est.")
-
-        # Operational Recommendations
-        if demand_val > 150:
-            st.error("Action Required: Dispatch reinforcement units immediately.")
-        elif demand_val > 50:
-            st.warning("Advisory: Demand approaching capacity.")
-        else:
-            st.success("Status: Optimal supply levels.")
-else:
-    st.caption("Select a route in the control panel and click Calculate to view details.")
-
-# ---------------- 8. SECONDARY METRICS ----------------
-st.divider()
-tab1, tab2 = st.tabs(["Historical Trends", "System Health"])
-
-with tab1:
-    st.subheader("Temporal Demand Patterns")
-    st.line_chart(data.groupby("hour")["trip_count"].mean(), color="#29B5E8")
-
-with tab2:
-    st.write("**Model Architecture:** RandomForest Regressor (v1.0.2)")
-    st.write("**Last Model Update:** 2024-06-15")
-    st.progress(0.84, text="Model R2 Accuracy: 84%")
+        if not p_row.empty:
+            p_id = p_row["LocationID"].values[0]
+            
+            # Use stored multiplier for consistent results
+            active_mult = inputs['surge_mult']
+            demand_val = predict_rides(p_id, active_surge_mult=active_mult)
+            
+            # --- UPDATE 4: REVENUE CALCULATION USES MULTIPLIER ---
+            est_rev = demand_val * 22.5 * active_mult
+            
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown(f"""
+                <div class="css-card">
+                    <div>
+                        <h3 style="color:#29B5E8; margin-top:0">Route Details</h3>
+                        <p style="color:white; font-size:18px; margin: 10px 0;"><b>From:</b> {inputs['p_zone']}</p>
+                        <p style="color:white; font-size:18px; margin: 10px 0;"><b>To:</b> {inputs['d_zone']}</p>
+                    </div>
+                    <div>
+                        <hr style="border-color:#363B47; margin: 15px 0;">
+                        <p style="color:#A0A0A0; margin:0">Surge Applied: <span style="color:white">{inputs['surge_pct']}% ({active_mult}x)</span></p>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+                
+            with c2:
+                st.markdown(f"""
+                <div class="css-card">
+                    <div>
+                        <h3 style="color:#29B5E8; margin-top:0">Financial Projection</h3>
+                    </div>
+                    <div style="display:flex; justify-content:space-between; align-items:flex-end; margin-bottom: 10px;">
+                        <div>
+                            <p style="color:#A0A0A0; margin-bottom:5px">Zone Demand</p>
+                            <span style="color:white; font-size:28px; font-weight:bold">{demand_val:.0f} <span style="font-size:16px; color:#A0A0A0">rides/hr</span></span>
+                        </div>
+                        <div style="text-align:right">
+                            <p style="color:#A0A0A0; margin-bottom:5px">Est. Revenue</p>
+                            <span style="color:#00FF99; font-size:28px; font-weight:bold">${est_rev:,.2f}</span>
+                        </div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+                
+            st.markdown("### 24-Hour Demand Forecast")
+            hours = list(range(24))
+            forecasts = []
+            for h in hours:
+                # Use the active multiplier for the forecast chart too
+                val = predict_rides(p_id, hour_val=h, active_surge_mult=active_mult)
+                forecasts.append(val)
+                
+            chart_df = pd.DataFrame({"Hour": hours, "Predicted Demand": forecasts})
+            st.line_chart(chart_df.set_index("Hour"), color="#29B5E8", width="stretch", height=300)
