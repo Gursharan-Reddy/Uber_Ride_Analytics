@@ -1,328 +1,432 @@
-import warnings
-import os
-import sys
-
-# -----------------------------------------------------------------------------
-# 1. WARNING SUPPRESSION
-# -----------------------------------------------------------------------------
-warnings.filterwarnings("ignore", message=".*sklearn.utils.parallel.delayed.*")
-warnings.filterwarnings("ignore", category=UserWarning, module="sklearn.utils.parallel")
-
 import streamlit as st
 import pandas as pd
-import joblib
-import datetime
-import pydeck as pdk
 import numpy as np
-import sqlite3
+import pydeck as pdk
+import altair as alt
+import datetime
+import sys
+import os
+import concurrent.futures
+import warnings
+from sklearn.cluster import KMeans
+from scipy.spatial.distance import cdist
 
-# -----------------------------------------------------------------------------
-# 2. PATH CONFIGURATION
-# -----------------------------------------------------------------------------
-BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-sys.path.append(BASE_DIR)
+# ---------------------------------------------------------------------
+# 0. CONFIG & WARNING SUPPRESSION
+# ---------------------------------------------------------------------
+st.set_page_config(page_title="Uber Operations Command", layout="wide", page_icon="Taxi")
+warnings.filterwarnings("ignore")
 
-from src.external_apis import fetch_nyc_weather, get_traffic_congestion, get_nyc_events
+# ---------------------------------------------------------------------
+# 1. PATH FIX
+# ---------------------------------------------------------------------
+current_file_path = os.path.abspath(__file__)
+app_dir = os.path.dirname(current_file_path)
+project_root = os.path.dirname(app_dir)
+if project_root not in sys.path: sys.path.insert(0, project_root)
+if app_dir not in sys.path: sys.path.insert(0, app_dir)
 
-# -----------------------------------------------------------------------------
-# 3. PAGE CONFIGURATION
-# -----------------------------------------------------------------------------
-st.set_page_config(
-    page_title="Uber Operations Command",
-    layout="wide",
-    initial_sidebar_state="expanded",
-    page_icon="Taxi"
-)
+# ---------------------------------------------------------------------
+# 2. IMPORTS
+# ---------------------------------------------------------------------
+try:
+    from main import backend
+    from src.external_apis import (
+        fetch_nyc_weather,
+        get_traffic_congestion,
+        get_nyc_events
+    )
+except ImportError as e:
+    st.error(f"System Error: {e}")
+    st.stop()
 
-# -----------------------------------------------------------------------------
-# 4. PROFESSIONAL UI STYLING
-# -----------------------------------------------------------------------------
-def render_professional_ui():
+# ---------------------------------------------------------------------
+# 3. CSS STYLING
+# ---------------------------------------------------------------------
+def render_css():
     st.markdown("""
         <style>
         .stApp { background-color: #0E1117; }
+        
         .css-card {
-            background-color: #262730;
+            background-color: #1F2229;
             border: 1px solid #363B47;
             border-radius: 10px;
-            padding: 20px;
-            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+            padding: 25px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
             margin-bottom: 20px;
-            height: 100%;          
-            min-height: 240px;     
-            display: flex;         
+            height: 280px; 
+            display: flex;
             flex-direction: column;
-            justify-content: space-between; 
+            justify-content: space-between;
         }
+        
         div[data-testid="stMetric"] {
             background-color: #1F2229;
             padding: 15px;
             border-radius: 8px;
-            border-left: 4px solid #29B5E8;
+            border-left: 5px solid #29B5E8;
             box-shadow: 0 2px 4px rgba(0,0,0,0.2);
-            transition: transform 0.2s;
         }
-        div[data-testid="stMetric"]:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 4px 8px rgba(41, 181, 232, 0.2);
+        div[data-testid="stMetricLabel"] {
+            font-size: 14px;
+            color: #A0A0A0;
         }
-        div.stButton > button {
-            background-color: #29B5E8;
-            color: white;
-            border: none;
-            border-radius: 6px;
-            padding: 10px 24px;
-            font-weight: 600;
-            transition: all 0.3s ease;
+        div[data-testid="stMetricValue"] {
+            font-size: 32px;
+            color: #FFFFFF;
         }
-        div.stButton > button:hover {
-            background-color: #1C9AD6;
-            box-shadow: 0 4px 12px rgba(41, 181, 232, 0.3);
+        div[data-testid="stMetricDelta"] {
+            font-size: 14px;
         }
-        section[data-testid="stSidebar"] {
-            background-color: #161920;
-            border-right: 1px solid #363B47;
-        }
-        h1, h2, h3 { color: #FFFFFF; font-family: 'Inter', sans-serif; }
         </style>
     """, unsafe_allow_html=True)
+render_css()
 
-render_professional_ui()
-
-# -----------------------------------------------------------------------------
-# 5. STATE INITIALIZATION
-# -----------------------------------------------------------------------------
-if 'live_stats' not in st.session_state:
-    st.session_state['live_stats'] = {"traffic": 0.0, "event": "No Data", "event_count": 0}
-if 'calculation_done' not in st.session_state:
-    st.session_state['calculation_done'] = False
-if 'route_inputs' not in st.session_state:
-    st.session_state['route_inputs'] = {}
-
-# -----------------------------------------------------------------------------
-# 6. ASSET LOADING
-# -----------------------------------------------------------------------------
-@st.cache_resource
-def load_assets():
-    try:
-        model_path = os.path.join(BASE_DIR, "outputs", "model.pkl")
-        db_path = os.path.join(BASE_DIR, "data", "taxi_system.db")
-        
-        if not os.path.exists(model_path):
-            return None, None, None
-            
-        model = joblib.load(model_path)
-        conn = sqlite3.connect(db_path, check_same_thread=False)
-        zones = pd.read_sql("SELECT * FROM zones", conn)
-        return model, zones, conn
-    except:
-        return None, None, None
-
-model, zones, db_conn = load_assets()
-
-if model is None:
-    st.error("System Offline: Model or Database missing. Please run init_db.py first.")
+# ---------------------------------------------------------------------
+# 4. LOAD DATA
+# ---------------------------------------------------------------------
+zones = backend.get_zone_data()
+if zones.empty:
+    st.error("Database missing. Run setup first.")
     st.stop()
 
-# -----------------------------------------------------------------------------
-# 7. SIDEBAR CONTROLS
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# 5. SESSION STATE
+# ---------------------------------------------------------------------
+if "live_stats" not in st.session_state:
+    st.session_state["live_stats"] = {"traffic": 0.0, "event": "Manual Mode", "event_count": 0, "api_error": None}
+if "calculation_done" not in st.session_state:
+    st.session_state["calculation_done"] = False
+if "route_inputs" not in st.session_state:
+    st.session_state["route_inputs"] = {}
+
+# ---------------------------------------------------------------------
+# 6. DYNAMIC NYC GRID SYSTEM (Safe Land Anchors)
+# ---------------------------------------------------------------------
+@st.cache_data
+def get_safe_coordinates(seed_var):
+    anchors = [
+        # Manhattan (West Side Inland)
+        (40.715, -74.009), (40.730, -74.005), (40.750, -73.999), (40.770, -73.989), (40.810, -73.955),
+        # Manhattan (East Side Inland)
+        (40.712, -74.000), (40.730, -73.985), (40.745, -73.975), (40.775, -73.958), (40.795, -73.940),
+        # Manhattan (Central)
+        (40.758, -73.985), (40.783, -73.971),
+        # Brooklyn (Downtown/North)
+        (40.692, -73.987), (40.688, -73.975), (40.705, -73.945), (40.715, -73.955),
+        # Brooklyn (Central/South)
+        (40.670, -73.975), (40.660, -73.950), (40.650, -73.960), (40.630, -73.950),
+        # Queens (LIC/Astoria)
+        (40.745, -73.935), (40.760, -73.920), (40.770, -73.910),
+        # Queens (Inland/Sunnyside/Woodside)
+        (40.740, -73.910), (40.730, -73.880), (40.745, -73.890),
+        # Bronx (Inland)
+        (40.820, -73.920), (40.840, -73.900), (40.850, -73.880)
+    ]
+    
+    np.random.seed(seed_var)
+    coords = {}
+    
+    for zid in zones["LocationID"].unique():
+        chosen = anchors[np.random.randint(0, len(anchors))]
+        lat_offset = np.random.uniform(-0.006, 0.006)
+        lon_offset = np.random.uniform(-0.006, 0.006)
+        coords[zid] = (chosen[0] + lat_offset, chosen[1] + lon_offset)
+    return coords
+
+# ---------------------------------------------------------------------
+# 7. SIDEBAR
+# ---------------------------------------------------------------------
 with st.sidebar:
     st.markdown("## Control Panel")
     
-    st.markdown("### Live Feeds")
-    use_live = st.toggle("Live Weather Sync", value=True)
+    use_live_weather = st.toggle("Live Weather Sync", True)
     
-    if use_live:
-        temp, cond = fetch_nyc_weather()
-        if temp:
-            st.info(f"NYC: {temp:.0f}F | {cond}")
-            sim_temp, sim_rain = temp, (1 if "Rain" in cond else 0)
+    if use_live_weather:
+        weather_data = fetch_nyc_weather()
+        if weather_data and len(weather_data) == 2 and weather_data[1] is not None:
+            temp, cond = weather_data
         else:
-            st.warning("Weather API Unreachable")
-            sim_temp, sim_rain = 72, 0
+            temp, cond = (20, "Clear")
+            
+        if cond and "Rain" in cond:
+            sim_weather = "Rain"
+        else:
+            sim_weather = "Clear"
+            
         sim_hour = datetime.datetime.now().hour
-        sim_date = datetime.datetime.now().date()
+        sim_date = datetime.date.today()
+        
+        st.info(f"🌡️ **{temp}°C** | {cond}")
     else:
         sim_date = st.date_input("Simulation Date", datetime.date.today())
         sim_hour = st.slider("Simulation Hour", 0, 23, 12)
-        sim_temp = st.slider("Temperature (F)", 0, 100, 72)
-        sim_rain = st.checkbox("Rain Conditions")
+        sim_weather = st.selectbox("Weather", ["Clear", "Rain", "Snow"])
 
     st.markdown("---")
     
-    tomtom_key = st.secrets["api_keys"]["tomtom"]
-    tm_key = st.secrets["api_keys"]["ticketmaster"]
-    
-    if st.button("Scan Traffic and Events", use_container_width=True):
-        with st.spinner("Scanning real-time sources..."):
-            event_name, event_count = get_nyc_events(tm_key)
-            congestion = get_traffic_congestion(40.7128, -74.0060, tomtom_key)
-            st.session_state['live_stats'] = {
-                "traffic": congestion, 
-                "event": event_name, 
-                "event_count": event_count
-            }
-            st.success("Data Updated!")
+    use_live_events = st.toggle("Live Event Sync", False)
+    manual_event_count = 0
+    if not use_live_events:
+        manual_event_count = st.slider("Manual Event Count", 0, 20, 2)
+        st.session_state["live_stats"]["event_count"] = manual_event_count
+        st.session_state["live_stats"]["event"] = "Manual Mode"
 
     st.markdown("---")
     
-    st.markdown("### Route Logistics")
-    
-    # --- UPDATE 1: SURGE SLIDER MODIFIED (0-100%) ---
     surge_pct = st.slider("Surge Percentage (%)", 0, 100, 0, step=5)
+    surge_multiplier = 1 + (surge_pct / 100)
     
-    # --- UPDATE 2: NORMALIZE TO MULTIPLIER ---
-    # Convert 0-100% to a 1.0x-2.0x multiplier
-    surge_multiplier = 1 + (surge_pct / 100.0)
+    p_zone = st.selectbox("Pickup Zone", zones["Zone"].unique())
+    d_options = zones[zones["Zone"] != p_zone]["Zone"].unique()
+    d_zone = st.selectbox("Dropoff Zone", d_options)
     
-    p_zone = st.selectbox("Pickup Point", zones["Zone"].unique(), index=0)
-    d_zone = st.selectbox("Dropoff Point", zones["Zone"].unique(), index=1)
-    
-    if st.button("Calculate Demand", type="primary", use_container_width=True):
-        st.session_state['calculation_done'] = True
-        st.session_state['route_inputs'] = {
-            "p_zone": p_zone,
-            "d_zone": d_zone,
-            "surge_pct": surge_pct,          # Store raw % for display
-            "surge_mult": surge_multiplier   # Store multiplier for math
-        }
-
-# -----------------------------------------------------------------------------
-# 8. PREDICTION ENGINE (Using Calculated Multiplier)
-# -----------------------------------------------------------------------------
-def predict_rides(loc_id, hour_val=None, active_surge_mult=None):
-    if hour_val is None: 
-        hour_val = sim_hour
-    
-    # Use the passed multiplier, or fall back to the global sidebar one
-    if active_surge_mult is None:
-        active_surge_mult = surge_multiplier
+    if st.button("Calculate Demand", type="primary"):
+        st.session_state["calculation_done"] = True
+        st.session_state["route_inputs"] = {"p_zone": p_zone, "d_zone": d_zone, "surge_mult": surge_multiplier}
         
-    day = sim_date.weekday()
-    row = {
-        "PULocationID": loc_id, "hour": hour_val, "day_of_week": day, 
-        "month": sim_date.month, "is_weekend": 1 if day >= 5 else 0, "TAVG": sim_temp,
-        "weather_Rain": 1 if sim_rain else 0, "weather_Clear": 0 if sim_rain else 1
-    }
-    df = pd.DataFrame([row])
-    if hasattr(model, 'feature_names_in_'):
-        df = df.reindex(columns=model.feature_names_in_, fill_value=0)
-    
-    # --- UPDATE 3: USE MULTIPLIER IN PREDICTION ---
-    return model.predict(df)[0] * active_surge_mult
+        # Check if secrets exist
+        try:
+            tomtom_key = st.secrets["api_keys"]["tomtom"]
+            tm_key = st.secrets["api_keys"]["ticketmaster"]
+        except:
+            tomtom_key = "invalid"
+            tm_key = "invalid"
+            st.error("Missing .streamlit/secrets.toml file!")
+        
+        with st.spinner("Syncing data streams..."):
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future_traffic = executor.submit(get_traffic_congestion, 40.7128, -74.0060, tomtom_key)
+                if use_live_events:
+                    future_events = executor.submit(get_nyc_events, tm_key)
+                
+                raw_traffic = future_traffic.result()
+                
+                # [FIX] NO RANDOM SIMULATION. REAL API ONLY.
+                if raw_traffic is None:
+                    live_traffic_val = 0.0
+                    api_status = "Error"
+                else:
+                    live_traffic_val = raw_traffic
+                    api_status = "OK"
+                
+                if use_live_events:
+                    e_name, e_cnt = future_events.result()
+                    event_name, event_cnt = e_name, e_cnt
+                else:
+                    event_name, event_cnt = "Manual Mode", manual_event_count
+                
+                st.session_state["live_stats"] = {
+                    "traffic": live_traffic_val, 
+                    "event": event_name, 
+                    "event_count": event_cnt,
+                    "api_error": api_status
+                }
 
-# -----------------------------------------------------------------------------
-# 9. MAIN DASHBOARD UI
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# 8. MAIN METRICS
+# ---------------------------------------------------------------------
 st.title("Uber Operations Command Center")
-st.markdown("Real-time predictive analytics and supply chain optimization.")
+st.markdown("Real-time predictive analytics.")
 
-st.markdown("### System Status")
-k1, k2, k3, k4 = st.columns(4)
+traffic_val = st.session_state["live_stats"]["traffic"]
+event_cnt = st.session_state["live_stats"]["event_count"]
+api_status = st.session_state["live_stats"].get("api_error", "OK")
 
-try:
-    avg_val = pd.read_sql(f"SELECT AVG(trip_count) FROM model_data WHERE hour = {sim_hour}", db_conn).iloc[0,0]
-except:
-    avg_val = 0
+# Display Error if API Failed
+if api_status == "Error":
+    st.error("⚠️ **Traffic Data Unavailable:** Check TomTom API Key in `.streamlit/secrets.toml` or Quota Limits.")
 
-stats = st.session_state['live_stats']
-k1.metric("Predicted Ride Vol", f"{avg_val:.1f}", delta="Normal Vol")
-k2.metric("Active Fleet", "1,240", delta="+12 Online")
-k3.metric("Traffic Congestion", f"{stats['traffic']*100:.0f}%", 
-          delta="High" if stats['traffic'] > 0.3 else "Flowing", delta_color="inverse")
-k4.metric("Live Events", f"{stats['event_count']}", delta=stats['event'][:10]+"..." if len(stats['event']) > 10 else stats['event'])
+p_id = zones[zones["Zone"] == p_zone]["LocationID"].values[0]
+demand_metric = backend.predict_demand(p_id, sim_hour, traffic_val, sim_weather, sim_date) + (event_cnt * 5)
+active_fleet = int(800 * (1.5 if (7 <= sim_hour <= 10 or 16 <= sim_hour <= 19) else 0.8))
+
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Predicted Ride Vol", f"{demand_metric:.0f}", delta="Zone Demand")
+c2.metric("Active Fleet", f"{active_fleet:,}", delta="Off-Peak" if active_fleet < 1000 else "Peak Capacity")
+c3.metric("Traffic Congestion", f"{traffic_val*100:.0f}%", delta="Live Status" if traffic_val > 0 else "Offline", delta_color="inverse")
+c4.metric("Live Events", event_cnt, delta="Active")
 
 st.markdown("---")
 
-st.markdown("### Demand Heatmap")
-with st.container():
-    map_df = zones.copy()
-    if len(map_df) > 500: map_df = map_df.sample(500)
-    
-    map_df["demand"] = map_df["LocationID"].apply(lambda x: predict_rides(x))
-    map_df["norm"] = map_df["demand"] / (map_df["demand"].max() + 1) 
+# ---------------------------------------------------------------------
+# 9. MAP VISUALIZATION
+# ---------------------------------------------------------------------
+st.markdown("### Molecular Demand Map")
 
-    centers = np.array([[40.75, -73.98], [40.71, -74.00], [40.78, -73.96]])
-    cluster = map_df["LocationID"] % len(centers)
-    base = centers[cluster]
-    map_df["lat"] = base[:, 0] + np.random.normal(0, 0.008, len(map_df))
-    map_df["lon"] = base[:, 1] + np.random.normal(0, 0.008, len(map_df))
+if st.session_state["calculation_done"]:
+    active_p_zone = st.session_state["route_inputs"]["p_zone"]
+    active_d_zone = st.session_state["route_inputs"]["d_zone"]
+else:
+    active_p_zone = p_zone
+    active_d_zone = d_zone
+
+route_seed = abs(hash(active_p_zone + active_d_zone)) % 9999
+dynamic_coords = get_safe_coordinates(route_seed)
+
+target_row = zones[zones["Zone"] == active_p_zone]
+view_lat, view_lon = (40.73, -73.95)
+if not target_row.empty:
+    tid = target_row["LocationID"].values[0]
+    view_lat, view_lon = dynamic_coords.get(tid, (40.73, -73.95))
+
+with st.spinner("Updating Molecular Structure..."):
+    map_df = zones.copy()
+    map_df["coords"] = map_df["LocationID"].map(dynamic_coords)
+    map_df["lat"] = map_df["coords"].apply(lambda x: x[0])
+    map_df["lon"] = map_df["coords"].apply(lambda x: x[1])
+    map_df["demand"] = map_df["LocationID"].apply(lambda x: backend.predict_demand(x, sim_hour, traffic_val, sim_weather, sim_date))
+    
+    active_zones = map_df[map_df["demand"] > 1].copy()
+    layers = []
+
+    if not active_zones.empty:
+        np.random.seed(route_seed)
+        upsampled_data = []
+        for _, row in active_zones.iterrows():
+            base_lat, base_lon = row['lat'], row['lon']
+            base_dem = row['demand']
+            for _ in range(15): 
+                new_lat = base_lat + np.random.normal(0, 0.002)
+                new_lon = base_lon + np.random.normal(0, 0.002)
+                new_dem = max(1, base_dem + np.random.randint(-3, 4))
+                upsampled_data.append([new_lat, new_lon, new_dem])
+        
+        upsampled_df = pd.DataFrame(upsampled_data, columns=["lat", "lon", "demand"])
+
+        n_clusters = min(120, len(upsampled_df))
+        kmeans = KMeans(n_clusters=n_clusters, random_state=route_seed, n_init=10).fit(upsampled_df[["lat", "lon"]], sample_weight=upsampled_df["demand"])
+        upsampled_df["cluster"] = kmeans.labels_
+        
+        cluster_df = upsampled_df.groupby("cluster").agg(
+            lat=("lat", "mean"), 
+            lon=("lon", "mean"), 
+            demand=("demand", "sum")
+        ).reset_index()
+
+        cluster_df["rank"] = cluster_df["demand"].rank(pct=True)
+        cluster_df["norm"] = cluster_df["rank"] 
+
+        def get_label(n):
+            if n > 0.60: return "High Demand"
+            elif n > 0.30: return "Medium Demand"
+            else: return "Low Demand"
+        cluster_df["label"] = cluster_df["norm"].apply(get_label)
+
+        cluster_df["ideal_radius"] = 30 + (cluster_df["norm"] ** 3) * 350
+        
+        coords = cluster_df[["lat", "lon"]].values
+        coords_m = coords.copy()
+        coords_m[:, 0] *= 111000 
+        coords_m[:, 1] *= 85000 
+        
+        dist_matrix = cdist(coords_m, coords_m)
+        np.fill_diagonal(dist_matrix, np.inf)
+        
+        nearest_dist = dist_matrix.min(axis=1)
+        cluster_df["max_safe_radius"] = nearest_dist * 0.45
+        
+        cluster_df["radius"] = np.minimum(cluster_df["ideal_radius"], cluster_df["max_safe_radius"])
+        cluster_df["radius"] = cluster_df["radius"].clip(lower=30) 
+
+        def color_map(n):
+            if n > 0.66: return [255, 50, 50]   # Red
+            elif n > 0.33: return [255, 140, 0] # Orange
+            else: return [0, 220, 120]          # Green
+        cluster_df["color"] = cluster_df["norm"].apply(color_map)
+
+        layers = [
+            pdk.Layer(
+                "ScatterplotLayer",
+                data=cluster_df,
+                get_position=["lon", "lat"],
+                get_radius="radius",
+                get_fill_color="color",
+                opacity=0.9,
+                pickable=True,
+                stroked=False,
+                filled=True,
+                radius_min_pixels=5,
+                radius_max_pixels=70
+            )
+        ]
 
     deck = pdk.Deck(
-        initial_view_state=pdk.ViewState(latitude=40.73, longitude=-73.98, zoom=11, pitch=50),
-        layers=[
-            pdk.Layer("HeatmapLayer", data=map_df, get_position=["lon", "lat"], get_weight="norm", radius_pixels=60, intensity=2, threshold=0.3),
-            pdk.Layer("ScatterplotLayer", data=map_df[map_df['demand'] > 100], get_position=["lon", "lat"], get_radius=100, get_fill_color=[255, 140, 0, 140], pickable=True)
-        ],
-        tooltip={"text": "{Zone}\nPredicted Demand: {demand:.1f}"}
+        layers=layers,
+        initial_view_state=pdk.ViewState(latitude=view_lat, longitude=view_lon, zoom=11.5, pitch=45, bearing=0),
+        tooltip={"text": "{label}"}
     )
     st.pydeck_chart(deck, width="stretch")
 
-if st.session_state['calculation_done']:
+# ---------------------------------------------------------------------
+# 10. RESULTS & FORECAST
+# ---------------------------------------------------------------------
+if st.session_state["calculation_done"]:
     st.markdown("---")
-    st.markdown("### Route Economics Analysis")
     
     inputs = st.session_state['route_inputs']
+    calc_p_id = zones[zones["Zone"] == inputs['p_zone']]["LocationID"].values[0]
+    base_demand = backend.predict_demand(calc_p_id, sim_hour, traffic_val, sim_weather, sim_date)
+    final_demand = base_demand + (event_cnt * 5)
     
-    if inputs['p_zone'] == inputs['d_zone']:
-        st.error("Pickup and Dropoff locations cannot be the same.")
-    else:
-        p_row = zones[zones["Zone"] == inputs['p_zone']]
-        d_row = zones[zones["Zone"] == inputs['d_zone']]
+    effective_mult = inputs['surge_mult']
+    if sim_hour < 6 or sim_hour >= 22:
+        effective_mult = max(effective_mult, 2.0)
+    
+    est_rev = final_demand * 22.5 * effective_mult
+
+    c1, c2 = st.columns(2)
+    with c1: 
+        st.markdown(f"""
+        <div class="css-card">
+            <div>
+                <h3 style="color:#29B5E8; margin-top:0; margin-bottom: 20px;">Route Details</h3>
+                <p style="color:white; font-size:16px; margin: 8px 0;"><b>From:</b> {inputs['p_zone']}</p>
+                <p style="color:white; font-size:16px; margin: 8px 0;"><b>To:</b> {inputs['d_zone']}</p>
+            </div>
+            <div>
+                <hr style="border-color:#363B47; margin: 15px 0;">
+                <p style="color:#A0A0A0; margin:0; font-size:14px;">Applied Surge: <span style="color:white">{effective_mult:.1f}x</span></p>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
         
-        if not p_row.empty:
-            p_id = p_row["LocationID"].values[0]
-            
-            # Use stored multiplier for consistent results
-            active_mult = inputs['surge_mult']
-            demand_val = predict_rides(p_id, active_surge_mult=active_mult)
-            
-            # --- UPDATE 4: REVENUE CALCULATION USES MULTIPLIER ---
-            est_rev = demand_val * 22.5 * active_mult
-            
-            c1, c2 = st.columns(2)
-            with c1:
-                st.markdown(f"""
-                <div class="css-card">
-                    <div>
-                        <h3 style="color:#29B5E8; margin-top:0">Route Details</h3>
-                        <p style="color:white; font-size:18px; margin: 10px 0;"><b>From:</b> {inputs['p_zone']}</p>
-                        <p style="color:white; font-size:18px; margin: 10px 0;"><b>To:</b> {inputs['d_zone']}</p>
-                    </div>
-                    <div>
-                        <hr style="border-color:#363B47; margin: 15px 0;">
-                        <p style="color:#A0A0A0; margin:0">Surge Applied: <span style="color:white">{inputs['surge_pct']}% ({active_mult}x)</span></p>
-                    </div>
+    with c2: 
+        st.markdown(f"""
+        <div class="css-card">
+            <div>
+                <h3 style="color:#29B5E8; margin-top:0; margin-bottom: 20px;">Financial Projection</h3>
+            </div>
+            <div style="display: flex; justify-content: space-between; align-items: flex-end; margin-top: auto;">
+                <div>
+                    <p style="color:#A0A0A0; margin-bottom:5px; font-size:14px;">Zone Demand</p>
+                    <p style="color:white; font-size:26px; font-weight:bold; margin:0;">
+                        {final_demand:.0f} <span style="font-size:16px; color:#A0A0A0; font-weight:normal;">rides/hr</span>
+                    </p>
                 </div>
-                """, unsafe_allow_html=True)
-                
-            with c2:
-                st.markdown(f"""
-                <div class="css-card">
-                    <div>
-                        <h3 style="color:#29B5E8; margin-top:0">Financial Projection</h3>
-                    </div>
-                    <div style="display:flex; justify-content:space-between; align-items:flex-end; margin-bottom: 10px;">
-                        <div>
-                            <p style="color:#A0A0A0; margin-bottom:5px">Zone Demand</p>
-                            <span style="color:white; font-size:28px; font-weight:bold">{demand_val:.0f} <span style="font-size:16px; color:#A0A0A0">rides/hr</span></span>
-                        </div>
-                        <div style="text-align:right">
-                            <p style="color:#A0A0A0; margin-bottom:5px">Est. Revenue</p>
-                            <span style="color:#00FF99; font-size:28px; font-weight:bold">${est_rev:,.2f}</span>
-                        </div>
-                    </div>
+                <div style="text-align: right;">
+                    <p style="color:#A0A0A0; margin-bottom:5px; font-size:14px;">Est. Revenue</p>
+                    <p style="color:#00FF99; font-size:32px; font-weight:bold; margin:0;">
+                        ${est_rev:,.2f}
+                    </p>
                 </div>
-                """, unsafe_allow_html=True)
-                
-            st.markdown("### 24-Hour Demand Forecast")
-            hours = list(range(24))
-            forecasts = []
-            for h in hours:
-                # Use the active multiplier for the forecast chart too
-                val = predict_rides(p_id, hour_val=h, active_surge_mult=active_mult)
-                forecasts.append(val)
-                
-            chart_df = pd.DataFrame({"Hour": hours, "Predicted Demand": forecasts})
-            st.line_chart(chart_df.set_index("Hour"), color="#29B5E8", width="stretch", height=300)
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    route_hash = abs(hash(inputs['p_zone'] + inputs['d_zone'])) % 5
+    
+    forecast = []
+    for h in range(24):
+        val = backend.predict_demand(calc_p_id, h, traffic_val, sim_weather, sim_date) + (event_cnt * 5)
+        if 6 <= h <= 9: val *= (1.5 + (route_hash * 0.2)) 
+        elif 17 <= h <= 20: val *= (1.5 + ((5-route_hash) * 0.2)) 
+        noise = np.sin(h + route_hash) * 3
+        forecast.append({"Hour": h, "Predicted Demand": max(5, val + noise)})
+    
+    chart_df = pd.DataFrame(forecast)
+    st.altair_chart(
+        alt.Chart(chart_df).mark_line(point=True, color="#29B5E8").encode(x="Hour", y="Predicted Demand"),
+        use_container_width=True
+    )
